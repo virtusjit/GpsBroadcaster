@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark background palette -->
+    <color name="background">#0F1117</color>
+    <color name="surface">#1A1D27</color>
+    <color name="input_background">#12141E</color>
+
+    <!-- Accent: electric blue/teal -->
+    <color name="accent">#00C2FF</color>
+    <color name="on_accent">#0F1117</color>
+
+    <!-- Text -->
+    <color name="text_primary">#E8EAF0</color>
+    <color name="text_secondary">#6B7280</color>
+
+    <!-- NMEA monospace text -->
+    <color name="nmea_color">#4ADE80</color>
+
+    <!-- Warnings -->
+    <color name="spoof_warn">#FF5252</color>
+
+    <!-- Divider -->
+    <color name="divider">#2A2D3A</color>
+</resources>
