@@ -61,6 +61,7 @@ class GpsBroadcastService : LifecycleService() {
         const val SPOOF_ALTITUDE_MIN = -100.0
         const val SPOOF_ALTITUDE_MAX = 2000.0
         const val SPOOF_JUMP_METERS = 5000.0
+        const val ANCHOR_MAX_DISTANCE = 10_000f
     }
 
     private var serverSocket: ServerSocket? = null
@@ -82,11 +83,17 @@ class GpsBroadcastService : LifecycleService() {
     @Volatile private var spoofDetected = false
     @Volatile private var lastAccuracy = 0f
     @Volatile private var satelliteInfoList: List<SatInfo> = emptyList()
+    @Volatile private var networkAnchor: Location? = null
 
     data class SatInfo(
         val prn: Int, val elevation: Float, val azimuth: Float,
         val snr: Float, val usedInFix: Boolean, val constellation: Int
     )
+
+    private val networkAnchorListener = android.location.LocationListener { loc ->
+        networkAnchor = loc
+        Log.i(TAG, "Network anchor updated: ${loc.latitude}, ${loc.longitude}, accuracy=${loc.accuracy}m")
+    }
 
     private val fusedCallback = object : LocationCallback() {
         override fun onLocationResult(result: LocationResult) {
@@ -127,7 +134,17 @@ class GpsBroadcastService : LifecycleService() {
 
         var spoof = false
 
-        if (loc.hasAltitude()) {
+        val anchor = networkAnchor
+        if (anchor != null) {
+            val distToAnchor = loc.distanceTo(anchor)
+            val threshold = ANCHOR_MAX_DISTANCE + anchor.accuracy
+            if (distToAnchor > threshold) {
+                Log.w(TAG, "Location ${distToAnchor.toInt()}m from network anchor (threshold ${threshold.toInt()}m) — spoofed GPS, using anchor fallback")
+                spoof = true
+            }
+        }
+
+        if (!spoof && loc.hasAltitude()) {
             val alt = loc.altitude
             if (alt < SPOOF_ALTITUDE_MIN || alt > SPOOF_ALTITUDE_MAX) {
                 Log.w(TAG, "Suspicious altitude: ${alt}m — possible spoofing")
@@ -135,29 +152,37 @@ class GpsBroadcastService : LifecycleService() {
             }
         }
 
-        val prev = lastValidLocation
-        if (prev != null) {
-            val dist = prev.distanceTo(loc)
-            val dt = (loc.time - prev.time) / 1000.0
-            if (dt > 0 && dist > SPOOF_JUMP_METERS && dist / dt > 340) {
-                Log.w(TAG, "Position jump ${dist.toInt()}m in ${dt.toInt()}s — possible spoofing")
-                spoof = true
+        if (!spoof) {
+            val prev = lastValidLocation
+            if (prev != null) {
+                val dist = prev.distanceTo(loc)
+                val dt = (loc.time - prev.time) / 1000.0
+                if (dt > 0 && dist > SPOOF_JUMP_METERS && dist / dt > 340) {
+                    Log.w(TAG, "Position jump ${dist.toInt()}m in ${dt.toInt()}s — possible spoofing")
+                    spoof = true
+                }
             }
         }
 
         spoofDetected = spoof
-        if (spoof) {
+
+        val useLoc = if (spoof && anchor != null) {
+            Log.i(TAG, "Fallback to network anchor: ${anchor.latitude}, ${anchor.longitude}, accuracy=${anchor.accuracy}m")
+            anchor
+        } else if (spoof) {
             sendStatusBroadcast()
             return
+        } else {
+            loc
         }
 
-        lastValidLocation = loc
-        val gnrmc = buildGnrmc(loc)
-        val gpvtg = buildGpvtg(loc)
-        val gngga = buildGngga(loc)
-        val gngsa = buildGngsa(loc)
+        lastValidLocation = useLoc
+        val gnrmc = buildGnrmc(useLoc)
+        val gpvtg = buildGpvtg(useLoc)
+        val gngga = buildGngga(useLoc)
+        val gngsa = buildGngsa(useLoc)
         val gngsv = buildGngsv()
-        val gngll = buildGngll(loc)
+        val gngll = buildGngll(useLoc)
         broadcastNmea(gnrmc)
         broadcastNmea(gpvtg)
         broadcastNmea(gngga)
@@ -216,6 +241,22 @@ class GpsBroadcastService : LifecycleService() {
         }
 
         try {
+            if (locationManager.allProviders.contains(LocationManager.NETWORK_PROVIDER)) {
+                locationManager.requestLocationUpdates(
+                    LocationManager.NETWORK_PROVIDER, 30_000L, 100f, networkAnchorListener
+                )
+                val last = locationManager.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                if (last != null) {
+                    networkAnchor = last
+                    Log.i(TAG, "Initial network anchor: ${last.latitude}, ${last.longitude}")
+                }
+                Log.i(TAG, "Network anchor listener registered (30s interval)")
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "Cannot get network location for anchor: ${e.message}")
+        }
+
+        try {
             val priority = when (providerMode) {
                 "network" -> Priority.PRIORITY_BALANCED_POWER_ACCURACY
                 else -> Priority.PRIORITY_HIGH_ACCURACY
@@ -235,6 +276,7 @@ class GpsBroadcastService : LifecycleService() {
     private fun stopLocationUpdates() {
         fusedClient.removeLocationUpdates(fusedCallback)
         try {
+            locationManager.removeUpdates(networkAnchorListener)
             locationManager.unregisterGnssStatusCallback(gnssCallback)
         } catch (_: Exception) {}
     }
