@@ -50,12 +50,15 @@ class GpsBroadcastService : LifecycleService() {
         const val EXTRA_CLIENT_COUNT = "client_count"
         const val EXTRA_LAST_NMEA = "last_nmea"
         const val EXTRA_SERVER_IP = "server_ip"
+        const val EXTRA_SERVER_PORT = "server_port"
         const val EXTRA_BIND_ADDRESS = "bind_address"
         const val EXTRA_PROVIDER = "extra_provider"
         const val EXTRA_SATELLITES_USED = "sats_used"
         const val EXTRA_SATELLITES_TOTAL = "sats_total"
         const val EXTRA_ACCURACY = "accuracy"
         const val EXTRA_SPOOF_FLAG = "spoof_flag"
+        const val EXTRA_INTERVAL_MS = "interval_ms"
+        const val DEFAULT_INTERVAL_MS = 1000L
 
         const val MAX_ACCURACY_METERS = 500f
         const val SPOOF_ALTITUDE_MIN = -100.0
@@ -72,6 +75,7 @@ class GpsBroadcastService : LifecycleService() {
     private var port = DEFAULT_PORT
     private var bindAddress = "0.0.0.0"
     private var providerMode = "fused"
+    private var intervalMs = DEFAULT_INTERVAL_MS
     private var lastNmea = ""
     @Volatile private var detectedServerIp: String? = null
 
@@ -121,6 +125,24 @@ class GpsBroadcastService : LifecycleService() {
             usedSatelliteCount = used
             satelliteInfoList = sats
         }
+    }
+
+    private fun saveConfigToPrefs() {
+        val prefs = getSharedPreferences("gps_broadcaster_prefs", MODE_PRIVATE)
+        prefs.edit()
+            .putInt("port", port)
+            .putString("bind", bindAddress)
+            .putString("provider", providerMode)
+            .putLong("interval", intervalMs)
+            .apply()
+    }
+
+    private fun restoreConfigFromPrefs() {
+        val prefs = getSharedPreferences("gps_broadcaster_prefs", MODE_PRIVATE)
+        port = prefs.getInt("port", port)
+        bindAddress = prefs.getString("bind", bindAddress) ?: bindAddress
+        providerMode = prefs.getString("provider", providerMode) ?: providerMode
+        intervalMs = prefs.getLong("interval", intervalMs)
     }
 
     private fun processLocation(loc: Location) {
@@ -183,12 +205,15 @@ class GpsBroadcastService : LifecycleService() {
         val gngsa = buildGngsa(useLoc)
         val gngsv = buildGngsv()
         val gngll = buildGngll(useLoc)
-        broadcastNmea(gnrmc)
-        broadcastNmea(gpvtg)
-        broadcastNmea(gngga)
-        broadcastNmea(gngsa)
-        for (gsv in gngsv) broadcastNmea(gsv)
-        broadcastNmea(gngll)
+        val batch = buildString {
+            appendNmea(gnrmc)
+            appendNmea(gpvtg)
+            appendNmea(gngga)
+            appendNmea(gngsa)
+            for (gsv in gngsv) appendNmea(gsv)
+            appendNmea(gngll)
+        }
+        broadcastBatch(batch)
         lastNmea = gnrmc
         sendStatusBroadcast()
     }
@@ -197,25 +222,49 @@ class GpsBroadcastService : LifecycleService() {
         super.onCreate()
         fusedClient = LocationServices.getFusedLocationProviderClient(this)
         locationManager = getSystemService(LOCATION_SERVICE) as LocationManager
+        restoreConfigFromPrefs()
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        port = intent?.getIntExtra(EXTRA_PORT, DEFAULT_PORT) ?: DEFAULT_PORT
-        bindAddress = intent?.getStringExtra(EXTRA_BIND_ADDRESS) ?: "0.0.0.0"
-        providerMode = intent?.getStringExtra(EXTRA_PROVIDER) ?: "fused"
+
+        val oldPort = port
+        val oldBind = bindAddress
+        val oldInterval = intervalMs
+
+        if (intent != null && intent.hasExtra(EXTRA_PORT)) {
+            port = intent.getIntExtra(EXTRA_PORT, DEFAULT_PORT)
+            bindAddress = intent.getStringExtra(EXTRA_BIND_ADDRESS) ?: "0.0.0.0"
+            providerMode = intent.getStringExtra(EXTRA_PROVIDER) ?: "fused"
+            intervalMs = intent.getLongExtra(EXTRA_INTERVAL_MS, DEFAULT_INTERVAL_MS)
+            saveConfigToPrefs()
+        } else {
+            // Процесс был перезапущен системой без Intent — восстанавливаем сохранённые значения
+            restoreConfigFromPrefs()
+        }
+
+        val needRestart = serverJob?.isActive == true &&
+                (port != oldPort || bindAddress != oldBind || intervalMs != oldInterval)
 
         startForeground(NOTIFICATION_ID, buildNotification("Запуск сервера на порту $port..."))
 
-        if (serverJob?.isActive == true) {
-            Log.i(TAG, "Server already running, skipping duplicate start")
-            return START_STICKY
+        if (needRestart) {
+            Log.i(TAG, "Config changed (port/bind/interval), restarting server: $oldBind:$oldPort -> $bindAddress:$port, interval=$intervalMs")
+            stopServer()
+            stopLocationUpdates()
         }
 
-        acquireLocks()
-        startServer()
-        startLocationUpdates()
+        if (serverJob?.isActive != true) {
+            if (wakeLock == null || wifiLock == null) {
+                acquireLocks()
+            }
+            startServer()
+            startLocationUpdates()
+        } else {
+            Log.i(TAG, "Server already running with same config, skipping restart")
+        }
+
         return START_STICKY
     }
 
@@ -261,13 +310,13 @@ class GpsBroadcastService : LifecycleService() {
                 "network" -> Priority.PRIORITY_BALANCED_POWER_ACCURACY
                 else -> Priority.PRIORITY_HIGH_ACCURACY
             }
-            val request = LocationRequest.Builder(priority, 1000L)
-                .setMinUpdateIntervalMillis(500L)
+            val request = LocationRequest.Builder(priority, intervalMs)
+                .setMinUpdateIntervalMillis(intervalMs / 2)
                 .setWaitForAccurateLocation(false)
                 .build()
 
             fusedClient.requestLocationUpdates(request, fusedCallback, Looper.getMainLooper())
-            Log.i(TAG, "FusedLocation started, mode=$providerMode, priority=$priority")
+            Log.i(TAG, "FusedLocation started, mode=$providerMode, priority=$priority, interval=${intervalMs}ms")
         } catch (e: SecurityException) {
             Log.e(TAG, "Location permission denied: ${e.message}")
         }
@@ -292,6 +341,7 @@ class GpsBroadcastService : LifecycleService() {
                 updateNotification("Сервер запущен: порт $port")
                 while (isActive) {
                     val client: Socket = serverSocket!!.accept()
+                    client.tcpNoDelay = true
                     client.soTimeout = 0
                     detectedServerIp = client.localAddress?.hostAddress
                     Log.i(TAG, "Client connected: ${client.inetAddress.hostAddress}, server IP: $detectedServerIp")
@@ -322,13 +372,17 @@ class GpsBroadcastService : LifecycleService() {
         }
     }
 
-    private fun broadcastNmea(nmea: String) {
-        val line = if (nmea.endsWith("\r\n")) nmea else "$nmea\r\n"
+    private fun StringBuilder.appendNmea(nmea: String) {
+        append(nmea)
+        if (!nmea.endsWith("\r\n")) append("\r\n")
+    }
+
+    private fun broadcastBatch(batch: String) {
         lifecycleScope.launch(Dispatchers.IO) {
             val deadClients = mutableListOf<PrintWriter>()
             for (writer in clients) {
                 try {
-                    writer.print(line)
+                    writer.print(batch)
                     writer.flush()
                     if (writer.checkError()) deadClients.add(writer)
                 } catch (_: Exception) {
@@ -355,6 +409,7 @@ class GpsBroadcastService : LifecycleService() {
             putExtra(EXTRA_CLIENT_COUNT, clients.size)
             putExtra(EXTRA_LAST_NMEA, lastNmea)
             putExtra(EXTRA_SERVER_IP, getHotspotIp())
+            putExtra(EXTRA_SERVER_PORT, port)
             putExtra(EXTRA_SATELLITES_USED, usedSatelliteCount)
             putExtra(EXTRA_SATELLITES_TOTAL, satelliteCount)
             putExtra(EXTRA_ACCURACY, lastAccuracy)

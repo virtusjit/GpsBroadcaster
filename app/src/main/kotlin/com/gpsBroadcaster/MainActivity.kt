@@ -29,10 +29,19 @@ class MainActivity : AppCompatActivity() {
             val clients  = intent.getIntExtra(GpsBroadcastService.EXTRA_CLIENT_COUNT, 0)
             val nmea     = intent.getStringExtra(GpsBroadcastService.EXTRA_LAST_NMEA) ?: ""
             val ip       = intent.getStringExtra(GpsBroadcastService.EXTRA_SERVER_IP) ?: "N/A"
+            val port     = intent.getIntExtra(GpsBroadcastService.EXTRA_SERVER_PORT, GpsBroadcastService.DEFAULT_PORT)
             val satsUsed = intent.getIntExtra(GpsBroadcastService.EXTRA_SATELLITES_USED, 0)
             val satsAll  = intent.getIntExtra(GpsBroadcastService.EXTRA_SATELLITES_TOTAL, 0)
             val accuracy = intent.getFloatExtra(GpsBroadcastService.EXTRA_ACCURACY, 0f)
             val spoof    = intent.getBooleanExtra(GpsBroadcastService.EXTRA_SPOOF_FLAG, false)
+            isRunning = true
+            binding.etPort.isEnabled = false
+            binding.actvIp.isEnabled = false
+            binding.actvProvider.isEnabled = false
+            binding.actvFrequency.isEnabled = false
+            binding.btnToggle.text = "Остановить"
+            binding.statusCard.visibility = View.VISIBLE
+            binding.tvServerPort.text = "Порт: $port"
             updateStatusUi(clients, nmea, ip, satsUsed, satsAll, accuracy, spoof)
         }
     }
@@ -93,6 +102,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         populateProviderSelector()
+        populateFrequencySelector()
 
         binding.tvNmeaToggle.setOnClickListener {
             val nmea = binding.tvLastNmea
@@ -119,6 +129,13 @@ class MainActivity : AppCompatActivity() {
         "network" to "Только сеть (WiFi + вышки)"
     )
 
+    private val frequencyOptions = linkedMapOf(
+        500L  to "2 Гц (каждые 0.5 сек)",
+        1000L to "1 Гц (каждую секунду) ★",
+        2000L to "0.5 Гц (каждые 2 сек)",
+        5000L to "0.2 Гц (каждые 5 сек)"
+    )
+
     private fun populateProviderSelector() {
         val labels = providerOptions.values.toList()
         val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, labels)
@@ -126,9 +143,21 @@ class MainActivity : AppCompatActivity() {
         binding.actvProvider.setText(labels[0], false)
     }
 
+    private fun populateFrequencySelector() {
+        val labels = frequencyOptions.values.toList()
+        val adapter = ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, labels)
+        binding.actvFrequency.setAdapter(adapter)
+        binding.actvFrequency.setText(labels[1], false)
+    }
+
     private fun getSelectedProvider(): String {
         val selected = binding.actvProvider.text?.toString() ?: ""
         return providerOptions.entries.find { it.value == selected }?.key ?: "gps"
+    }
+
+    private fun getSelectedIntervalMs(): Long {
+        val selected = binding.actvFrequency.text?.toString() ?: ""
+        return frequencyOptions.entries.find { it.value == selected }?.key ?: 1000L
     }
 
     private fun populateIpSelector() {
@@ -169,10 +198,22 @@ class MainActivity : AppCompatActivity() {
 
     // ── Service control ───────────────────────────────────────────────────────
 
+    private fun parsePortOrNull(): Int? {
+        val raw = binding.etPort.text?.toString()?.trim().orEmpty()
+        val p = raw.toIntOrNull() ?: return null
+        return p.takeIf { it in 1024..65535 }
+    }
+
     private fun startBroadcast() {
-        val port = binding.etPort.text.toString().toIntOrNull()
-            ?.takeIf { it in 1024..65535 }
-            ?: GpsBroadcastService.DEFAULT_PORT
+        val port = parsePortOrNull()
+        if (port == null) {
+            Toast.makeText(
+                this,
+                "Введите порт 1024–65535. Порты ниже 1024 требуют root.",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
@@ -198,21 +239,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun doStartService(
-        port: Int = binding.etPort.text.toString().toIntOrNull()
-            ?.takeIf { it in 1024..65535 } ?: GpsBroadcastService.DEFAULT_PORT
+        port: Int = parsePortOrNull() ?: GpsBroadcastService.DEFAULT_PORT
     ) {
         val bindIp = getSelectedIp()
         val provider = getSelectedProvider()
+        val intervalMs = getSelectedIntervalMs()
         val intent = Intent(this, GpsBroadcastService::class.java).apply {
             putExtra(GpsBroadcastService.EXTRA_PORT, port)
             putExtra(GpsBroadcastService.EXTRA_BIND_ADDRESS, bindIp)
             putExtra(GpsBroadcastService.EXTRA_PROVIDER, provider)
+            putExtra(GpsBroadcastService.EXTRA_INTERVAL_MS, intervalMs)
         }
         ContextCompat.startForegroundService(this, intent)
         isRunning = true
         binding.etPort.isEnabled = false
         binding.actvIp.isEnabled = false
         binding.actvProvider.isEnabled = false
+        binding.actvFrequency.isEnabled = false
         binding.btnToggle.text = "Остановить"
         binding.statusCard.visibility = View.VISIBLE
         binding.tvServerPort.text = "Порт: $port"
@@ -225,6 +268,7 @@ class MainActivity : AppCompatActivity() {
         binding.etPort.isEnabled = true
         binding.actvIp.isEnabled = true
         binding.actvProvider.isEnabled = true
+        binding.actvFrequency.isEnabled = true
         binding.btnToggle.text = "Запустить"
         binding.tvClientCount.text = "Клиенты: 0"
         binding.tvSatellites.text = "Спутники: —"
